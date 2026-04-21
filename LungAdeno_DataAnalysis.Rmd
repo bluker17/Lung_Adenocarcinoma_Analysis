@@ -1,0 +1,697 @@
+---
+title: "BINF6310_ Final_Project"
+author: "Bobby Luker"
+date: "2026-04-18"
+output: pdf_document
+---
+
+# Initialize my environment and establish all needed libraries
+```{r, message=FALSE, warning=FALSE}
+rm(list=ls())
+setwd("/Users/bobbyluker/Desktop/UNCC/BINF6311/Project/data/")
+
+library(readxl) # Reads in excel files
+
+library(stringr) # Cleans column names
+library(dplyr) # Data wrangling
+
+library(limma) # Used for statistical modeling
+
+library(ggplot2) # Data visualization
+library(ggrepel) # Volcano plot options
+
+library(clusterProfiler) # Used for GO enrichment and GSEA
+library(org.Hs.eg.db) # Maps genes to EntrezIDs for GO enrichment
+library(enrichplot) # GO enrichment plotting
+
+library(knitr) # Knits markdown tables to pdf
+library(kableExtra) # Formats tables
+```
+
+
+# Import the data file and prep for PCA
+```{r}
+lung_data <- read.csv("GSE40419_LC-87_RPKM_expression.csv")
+
+# Extract expression values only
+expr_data <- lung_data[, 7:ncol(lung_data)]
+
+# Add gene column for aggregation
+expr_data$gene <- lung_data$gene
+
+# Aggregate duplicate genes by mean expression
+expr_data <- aggregate(. ~ gene, data = expr_data, FUN = mean)
+
+# Set row names and remove gene column
+rownames(expr_data) <- expr_data$gene
+expr_data$gene <- NULL
+
+# Filter low-expression genes
+filtered_lung_data <- expr_data[rowMeans(expr_data) > 0.5, ]
+
+# Log transform with a pseudocount of 1
+log_fld <- log2(filtered_lung_data + 1)
+
+# Transpose for PCA
+trans_fld <- t(log_fld)
+```
+
+
+# Import the metadata
+```{r}
+metadata <- read_excel("SuppTable1.xlsx")
+
+# Clean column names (remove spaces and line breaks)
+colnames(metadata) <- str_trim(str_replace_all(colnames(metadata), "[\r\n]", ""))
+
+# Keep only relevant columns
+metadata <- metadata %>% dplyr::select(
+  Publication_index,
+  Smoking_status = `Smoking_status(0=neverSmoker;1=smoker;2=current_smoker;3=unknown)`,
+  Cancer_RNAseq = `Cancer_RNAseq(0=no;1=yes)`,
+  Normal_RNAseq = `Normal_RNAseq(0=no;1=yes)`
+)
+
+# Define Smoking_Group
+metadata$Smoking_Group <- case_when(
+  metadata$`Smoking_status` %in% c(1,2) ~ "Smoker",
+  metadata$`Smoking_status` == 0 ~ "Non_Smoker",
+  TRUE ~ "Unknown"
+)
+
+# Categorize the "_nor" samples as smoker, non-smoker, or unknown
+sample_ids <- rownames(trans_fld)
+base_ids <- sub("_nor$", "", sample_ids)
+metadata <- metadata[match(base_ids, metadata$Publication_index), ]
+```
+
+
+
+# Creating table containing the sample size by tissue and smoker status
+```{r}
+# Establishing the tumor and non-tumor group sizes
+tissue <- c(rep("Tumor", 87), rep("Normal", 77))
+
+# Creating data frame of sample sizes by tissue and smoker status
+sample_count_df <- data.frame(
+  Group = tissue,
+  Smoking = metadata$Smoking_Group
+)
+
+# Converting data frame into a table
+sample_count_table <- sample_count_df %>%
+  group_by(Group, Smoking) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  tidyr::pivot_wider(names_from = Smoking, values_from = n, values_fill = 0)
+
+# Preparing table to be knit to PDF
+sample_count_table %>%
+  kable(format = "latex", caption = "Sample Sizes by Group and Smoking Status") %>%
+  kable_styling(full_width = FALSE, position = "center") %>%
+  column_spec(1, bold = TRUE)
+```
+
+# Paired Smoker Tissue Differential Expression Analysis using "limma" 
+```{r}
+# Removing '_nor' from normal samples to correctly pair data
+sample_names <- colnames(log_fld)
+sample_clean <- sub("_nor$", "", sample_names)
+
+# Defining patient and grouping
+patient <- factor(sample_clean)
+group <- ifelse(grepl("_nor$", sample_names), "Normal", "Tumor")
+group <- factor(group, levels = c("Normal", "Tumor"))
+
+# Checking that there are 77 pairs.
+metadata_paired <- table(patient, group)
+
+metadata_paired <- rownames(metadata_paired)[
+  metadata_paired[, "Normal"] > 0 &
+  metadata_paired[, "Tumor"] > 0
+]
+
+# Selecting the patients that have tumor and normal tissue samples
+keep <- patient %in% metadata_paired
+
+log_fld_paired <- log_fld[, keep]
+patient <- droplevels(patient[keep])
+group <- droplevels(group[keep])
+
+# Code to verify that there are 77 patient pairs
+# cat("Patients with incomplete pairs (MUST be empty):\n")
+# print(table(patient)[table(patient) != 2])
+# 
+# cat("\nFinal sample counts:\n")
+# print(table(group))
+# cat("\nTotal patients:\n")
+# print(length(unique(patient)))
+
+# Create matrix for limma fitting
+paired_matrix <- model.matrix(~ patient + group)
+
+# Fit linear model using limma, eBayes stabilizes variance estimates
+fit <- lmFit(log_fld_paired, paired_matrix)
+fit <- eBayes(fit)
+
+# Extract result
+results_paired <- topTable(
+  fit,
+  coef = "groupTumor",
+  number = Inf,
+  adjust.method = "BH"
+)
+
+results_paired$gene <- rownames(results_paired)
+
+# Label Significance of DEGs
+results_paired$Regulation <- "Not Significant"
+results_paired$Regulation[
+  results_paired$adj.P.Val < 0.05 & results_paired$logFC > 1
+] <- "Upregulated"
+results_paired$Regulation[
+  results_paired$adj.P.Val < 0.05 & results_paired$logFC < -1
+] <- "Downregulated"
+
+# Collecting the top 10 most significant DEGs for the plot
+top_genes <- results_paired %>%
+  dplyr::filter(adj.P.Val < 0.01 & abs(logFC) > 2) %>%
+  dplyr::arrange(adj.P.Val) %>%
+  head(10)
+
+# Counts of DEGs
+results_paired %>%
+  filter(adj.P.Val < 0.05 & abs(logFC) > 1) %>%
+  summarise(
+    Total = n(),
+    Upregulated = sum(logFC > 1),
+    Downregulated = sum(logFC < -1)
+  )
+
+# Create volcano plot
+volcano_paired <- ggplot(results_paired, aes(x = logFC, y = -log10(adj.P.Val))) +
+  
+  geom_point(aes(color = Regulation), alpha = 0.6, size = 1.5) +
+  
+  #Highlight and label top 10 DEGs
+  geom_point(
+    data = top_genes,
+    aes(x = logFC, y = -log10(adj.P.Val)),
+    color = "orange",
+    size = 2
+  ) +
+  
+  geom_text_repel(
+    data = top_genes,
+    aes(label = gene),
+    size = 3,
+    max.overlaps = 20
+  ) +
+  
+  # Threshold lines
+  geom_vline(xintercept = c(-1, 1), linetype = "dashed") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed") +
+  
+  # Point colors
+  scale_color_manual(values = c(
+    "Upregulated" = "red",
+    "Downregulated" = "blue",
+    "Not Significant" = "grey"
+  )) +
+  
+  # Labels
+  theme_minimal() +
+  labs(
+    x = "Log2 Fold Change",
+    y = "-log10 Adjusted P-value",
+    color = "Regulation"
+  )
+
+print(volcano_paired)
+```
+
+# Paired DEG GO Enrichment
+```{r}
+# Define paired DEGs from the results_paired
+paired_deg <- results_paired %>%
+  dplyr::filter(adj.P.Val < 0.05 & abs(logFC) > 1)
+
+# Convert gene symbols to Entrez IDs
+paired_deg_ids <- bitr(
+  paired_deg$gene,
+  fromType = "SYMBOL",
+  toType = "ENTREZID",
+  OrgDb = org.Hs.eg.db
+) %>%
+  dplyr::distinct(ENTREZID, .keep_all = TRUE)
+
+# Remove duplicates (safety step)
+paired_deg_ids <- paired_deg_ids[!duplicated(paired_deg_ids$ENTREZID), ]
+
+# Define background by all genes
+background_ids <- bitr(
+  rownames(results_paired),
+  fromType = "SYMBOL",
+  toType = "ENTREZID",
+  OrgDb = org.Hs.eg.db
+) %>%
+  dplyr::distinct(ENTREZID, .keep_all = TRUE)
+
+background_ids <- background_ids[!duplicated(background_ids$ENTREZID), ]
+
+# GO enrichment
+go_paired <- enrichGO(
+  gene = paired_deg_ids$ENTREZID,
+  universe = background_ids$ENTREZID,
+  OrgDb = org.Hs.eg.db,
+  ont = "BP",
+  pAdjustMethod = "BH",
+  pvalueCutoff = 0.05,
+  readable = TRUE
+)
+
+# Create Plot
+go_enrich_paired_DEGs <- dotplot(go_paired, showCategory = 12) +
+  theme_minimal(base_size = 12) +
+  scale_color_continuous(
+    low = "blue",
+    high = "red",
+    name = "Adj p-value"
+  )
+
+print(go_enrich_paired_DEGs)
+```
+
+# Paired Smoker Tissue interaction with Smoking Status Differential Expression Analysis using "limma" 
+```{r}
+# Use paired dataset (already created earlier: log_fld_paired)
+sample_names <- colnames(log_fld_paired)
+
+# Create metadata_interaction 
+metadata_interaction <- metadata[match(patient, metadata$Publication_index), ]
+metadata_interaction$Smoking_Group <- factor(metadata_interaction$Smoking_Group)
+metadata_interaction$Tissue <- group
+metadata_interaction$Patient <- patient
+
+# Model matrix
+interaction_matrix <- model.matrix(~ Patient + Tissue * Smoking_Group, data = metadata_interaction)
+
+# Fit model
+interaction_fit <- lmFit(log_fld_paired, interaction_matrix)
+interaction_fit <- eBayes(interaction_fit)
+
+# Extract interaction term
+interaction_results <- topTable(
+  interaction_fit,
+  coef = "TissueTumor:Smoking_GroupSmoker",
+  number = Inf,
+  adjust.method = "BH"
+)
+
+interaction_results$gene <- rownames(interaction_results)
+
+# Significance labeling
+interaction_results$Significance <- "Not Significant"
+interaction_results$Significance[
+  interaction_results$adj.P.Val < 0.05 & interaction_results$logFC > 0
+] <- "Positive Interaction"
+interaction_results$Significance[
+  interaction_results$adj.P.Val < 0.05 & interaction_results$logFC < 0
+] <- "Negative Interaction"
+
+# Top genes (same logic, unchanged)
+top_genes <- interaction_results %>%
+  dplyr::filter(adj.P.Val < 0.05 & abs(logFC) > 1) %>%
+  dplyr::arrange(adj.P.Val) %>%
+  head(10)
+
+# DEG summary (same logic, unchanged)
+interaction_results %>%
+  dplyr::filter(adj.P.Val < 0.05 & abs(logFC) > 0) %>%
+  dplyr::summarise(
+    Total = n(),
+    Upregulated = sum(logFC > 0),
+    Downregulated = sum(logFC < 0)
+  )
+
+# Volcano plot (unchanged structure)
+volcano_interaction <- ggplot(interaction_results,
+       aes(x = logFC, y = -log10(adj.P.Val))) +
+  
+  geom_point(aes(color = Significance), alpha = 0.6, size = 1.5) +
+  
+  geom_point(data = top_genes,
+             aes(x = logFC, y = -log10(adj.P.Val)),
+             color = "orange", size = 2.2) +
+  
+  geom_text_repel(data = top_genes,
+                  aes(label = gene),
+                  size = 3,
+                  max.overlaps = 20,
+                  box.padding = 0.4,
+                  point.padding = 0.3,
+                  segment.color = "grey40") +
+  
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  
+  scale_color_manual(values = c(
+    "Positive Interaction" = "red",
+    "Negative Interaction" = "blue",
+    "Not Significant" = "grey"
+  )) +
+  
+  theme_minimal() +
+  
+  labs(
+    x = "Interaction Effect (Smoking x Tumor vs Normal)",
+    y = "-log10 Adjusted P-value",
+    color = "Significance"
+  )
+
+print(volcano_interaction)
+```
+
+# GSEA plot of the interaction results
+```{r}
+gene_list <- interaction_results$logFC
+names(gene_list) <- interaction_results$gene
+
+gsea <- gseGO(
+  geneList = sort(gene_list, decreasing = TRUE),
+  OrgDb = org.Hs.eg.db,
+  ont = "BP",
+  keyType = "SYMBOL"
+)
+
+gsea_plot <- dotplot(gsea, showCategory = 12, color = "NES") +
+  theme_minimal(base_size = 12) + 
+  scale_color_gradient2(
+    low = "blue",
+    mid = "white",
+    high = "red",
+    midpoint = 0
+  )
+
+ print(gsea_plot)
+```
+
+
+# PCA Analysis
+```{r}
+# Executing PCA
+pca <- prcomp(trans_fld, scale. = TRUE)
+
+# Buiding PCA data frame for plotting
+pca_df <- data.frame(
+  Sample = rownames(pca$x),
+  PC1 = pca$x[,1],
+  PC2 = pca$x[,2],
+  Group = tissue,
+  Smoking_Group = metadata$Smoking_Group
+)
+
+# Creating the PCA plot
+pca_plot <- ggplot(pca_df, aes(x = PC1, y = PC2, color = Group, fill = Group, shape = Smoking_Group)) +
+  geom_point(size = 2.5, stroke = 0.5, color = "black") +
+  
+  # Ellipses only for smoker and non-smoker
+  stat_ellipse(
+    data = subset(pca_df, Smoking_Group %in% c("Smoker", "Non_Smoker")),
+    aes(linetype = Smoking_Group),
+    type = "norm", linewidth = 1, alpha = 0.6
+  ) +
+  
+  theme_minimal() +
+  scale_color_manual(values = c("Tumor" = "salmon", "Normal" = "#4DB6AC")) +
+  scale_fill_manual(values = c("Tumor" = "salmon", "Normal" = "#4DB6AC")) +
+  scale_shape_manual(values = c("Non_Smoker" = 21, "Smoker" = 24, "Unknown" = 22)) +
+  labs(
+    x = paste0("PC1 (", round(summary(pca)$importance[2,1]*100,1), "% variance)"),
+    y = paste0("PC2 (", round(summary(pca)$importance[2,2]*100,1), "% variance)")
+  )
+
+print(pca_plot)
+```
+
+# Unpaired Tissue Differential Expression Analysis using "limma" 
+```{r}
+# Create matrix for limma fitting
+unpaired_matrix <- model.matrix(~ tissue)
+colnames(unpaired_matrix) <- c("Intercept", "Tumor_vs_Normal")
+
+# Fit linear model using limma, eBayes stabilizes variance estimates
+unpaired_fit <- lmFit(log_fld, unpaired_matrix)
+unpaired_fit <- eBayes(unpaired_fit)
+
+# Extract result
+unpaired_results <- topTable(unpaired_fit,
+                    coef = "Tumor_vs_Normal",
+                    number = Inf,
+                    adjust.method = "BH")
+
+# Labeling significance of DEGs
+unpaired_results$gene <- rownames(unpaired_results)
+unpaired_results$Regulation <- "Not Significant"
+unpaired_results$Regulation[unpaired_results$adj.P.Val < 0.05 & unpaired_results$logFC > 1] <- "Upregulated"
+unpaired_results$Regulation[unpaired_results$adj.P.Val < 0.05 & unpaired_results$logFC < -1] <- "Downregulated"
+
+# Collecting the top 10 most significant DEGs for the plot
+top_genes <- unpaired_results %>%
+  dplyr::filter(adj.P.Val < 0.01 & abs(logFC) > 2) %>%
+  dplyr::arrange(adj.P.Val) %>%
+  head(10)
+
+# Counts of DEGs
+unpaired_results %>%
+  filter(adj.P.Val < 0.05 & abs(logFC) > 1) %>%
+  summarise(
+    Total = n(),
+    Upregulated = sum(logFC > 1),
+    Downregulated = sum(logFC < -1)
+  )
+
+# Creating volcano plot
+volvano_tumor_v_normal <- ggplot(unpaired_results, 
+  aes(x = logFC, y = -log10(adj.P.Val))) +
+  geom_point(aes(color = Regulation), alpha = 0.6) +
+  
+  # Highlight and label top 10 DEGs
+  geom_point(data = top_genes, aes(x = logFC, y = -log10(adj.P.Val)), color = "orange", size = 2) +
+  geom_text_repel(data = top_genes,
+                  aes(label = gene),
+                  size = 3,
+                  max.overlaps = 20) +
+  
+  # Threshold lines
+  geom_vline(xintercept = c(-1, 1), linetype = "dashed", color = "black") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "black") +
+  
+  # Point colors
+  scale_color_manual(values = c(
+    "Upregulated" = "red",
+    "Downregulated" = "blue",
+    "Not Significant" = "grey"
+  )) +
+  
+  # Labels & theme
+  labs(
+       x = "Log2 Fold Change (Tumor vs Normal)",
+       y = "-log10 Adjusted P-value",
+       color = "Regulation") +
+  theme_minimal()
+
+print(volvano_tumor_v_normal)
+```
+
+# Unpaired Non-Smoker Tissue Differential Expression Analysis using "limma" 
+```{r}
+# Create combined factor of tumor/normal and smoking status
+Smoking_Groups <- factor(paste(tissue, metadata$Smoking_Group, sep = "_"))
+
+# Create matrix for limma fitting. Setting intercept to 0 to explicitly compare the smoking conditions. Otherwise, the non_smoker group will be compared to a hidden baseline group mean (intercept)
+smoker_group_matrix <- model.matrix(~0 + Smoking_Groups)
+colnames(smoker_group_matrix) <- make.names(levels(Smoking_Groups)) # ensures valid names
+
+# Fit linear model
+non_smoker_fit <- lmFit(log_fld, smoker_group_matrix)
+
+# Defining a matrix to compare specific groups
+nonsmoker_contrast_matrix <- makeContrasts(
+  Tumor_Non_Smoker_vs_Normal_Non_Smoker = Tumor_Non_Smoker - Normal_Non_Smoker,
+  levels = smoker_group_matrix
+)
+
+# Fit linear model using limma, eBayes stabilizes variance estimates
+non_smoker_fit <- contrasts.fit(non_smoker_fit, nonsmoker_contrast_matrix)
+non_smoker_fit <- eBayes(non_smoker_fit)
+
+# Extract result
+results_non_smoker <- topTable(non_smoker_fit, number = Inf)
+results_non_smoker$gene <- rownames(results_non_smoker)
+
+# Labeling Significance of DEGs
+results_non_smoker$Significance <- "Not Significant"
+results_non_smoker$Significance[results_non_smoker$adj.P.Val < 0.05 & results_non_smoker$logFC > 1] <- "Upregulated"
+results_non_smoker$Significance[results_non_smoker$adj.P.Val < 0.05 & results_non_smoker$logFC < -1] <- "Downregulated"
+
+# Collecting the top 10 most significant DEGs for the plot
+top_genes <- results_non_smoker %>%
+  dplyr::filter(adj.P.Val < 0.01 & abs(logFC) > 2) %>%
+  head(10)
+
+# Counts of DEGs
+results_non_smoker %>%
+  filter(adj.P.Val < 0.05 & abs(logFC) > 1) %>%
+  summarise(
+    Total = n(),
+    Upregulated = sum(logFC > 1),
+    Downregulated = sum(logFC < -1)
+  )
+
+# Creating volcano plot
+volcano_non_smoker <- ggplot(results_non_smoker, aes(x = logFC, y = -log10(adj.P.Val))) +
+  geom_point(aes(color = Significance), alpha = 0.6, size = 1.5) +
+  
+  # Highlight and label top 10 DEGs
+  geom_point(data = top_genes, aes(x = logFC, y = -log10(adj.P.Val)), color = "orange", size = 2) +
+  geom_text_repel(data = top_genes, aes(label = gene), size = 3, max.overlaps = 20) +
+  
+  # Threshold lines
+  geom_vline(xintercept = c(-1, 1), linetype = "dashed") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed") +
+  
+  # Point colors
+  scale_color_manual(values = c(
+    "Upregulated" = "red",
+    "Downregulated" = "blue",
+    "Not Significant" = "grey"
+  )) +
+  
+  theme_minimal() +
+  theme(legend.key.size = unit(0.5, "cm")) +
+  labs(
+       x = "Log2 Fold Change (Non-Smoker: Tumor vs Normal)",
+       y = "-log10 Adjusted P-value",
+       color = "Regulation")
+
+print(volcano_non_smoker)
+```
+
+# Unpaired Smoker Tissue Differential Expression Analysis using "limma" 
+```{r}
+# Fit linear model
+smoker_fit <- lmFit(log_fld, smoker_group_matrix)
+
+# Create matrix for limma fitting
+smoker_contrast_matrix <- makeContrasts(
+  Tumor_Smoker_vs_Normal_Smoker = Tumor_Smoker - Normal_Smoker,
+  levels = smoker_group_matrix
+)
+
+# Fit linear model using limma, eBayes stabilizes variance estimates
+smoker_fit <- contrasts.fit(smoker_fit, smoker_contrast_matrix)
+smoker_fit <- eBayes(smoker_fit)
+
+# Extract result
+results_smoker <- topTable(smoker_fit, number = Inf)
+results_smoker$gene <- rownames(results_smoker)
+
+# Labeling Significance of DEGs
+results_smoker$Significance <- "Not Significant"
+results_smoker$Significance[results_smoker$adj.P.Val < 0.05 & results_smoker$logFC > 1] <- "Upregulated"
+results_smoker$Significance[results_smoker$adj.P.Val < 0.05 & results_smoker$logFC < -1] <- "Downregulated"
+
+# Collecting the top 10 most significant DEGs for the plot
+top_genes <- results_smoker %>%
+  dplyr::filter(adj.P.Val < 0.01 & abs(logFC) > 2) %>%
+  head(10)
+
+# Counts of DEGs
+results_smoker %>%
+  filter(adj.P.Val < 0.05 & abs(logFC) > 1) %>%
+  summarise(
+    Total = n(),
+    Upregulated = sum(logFC > 1),
+    Downregulated = sum(logFC < -1)
+  )
+
+# Creating Volcano plot
+volcano_smoker <- ggplot(results_smoker, aes(x = logFC, y = -log10(adj.P.Val))) +
+  geom_point(aes(color = Significance), alpha = 0.6, size = 1.5) +
+  
+  # Highlight and label top 10 DEGs
+  geom_point(data = top_genes, aes(x = logFC, y = -log10(adj.P.Val)), color = "orange", size = 2) +
+  geom_text_repel(data = top_genes, aes(label = gene), size = 3, max.overlaps = 20) +
+  
+  # Threshold lines
+  geom_vline(xintercept = c(-1, 1), linetype = "dashed") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed") +
+  
+  # Point Colors
+  scale_color_manual(values = c(
+    "Upregulated" = "red",
+    "Downregulated" = "blue",
+    "Not Significant" = "grey"
+  )) +
+  
+  # Labels and theme
+  theme_minimal() +
+  theme(legend.key.size = unit(0.5, "cm")) +
+  labs(
+       x = "Log2 Fold Change (Smoker: Tumor vs Normal)",
+       y = "-log10 Adjusted P-value",
+       color = "Regulation")
+
+print(volcano_smoker)
+```
+
+
+
+# Table of the 3 most differentiated genes for each group
+```{r}
+# Function to select the top 3 up/down genes and bind the rows together
+get_top_genes <- function(df, top_n = 3, logfc_cut = 1, pval_cut = 0.05, group_name = "") {
+  up <- df %>%
+    filter(logFC > logfc_cut & adj.P.Val < pval_cut) %>%
+    arrange(adj.P.Val) %>%
+    head(top_n) %>%
+    mutate(Regulation = "Upregulated", Comparison = group_name) %>%
+    dplyr::select(Comparison, Regulation, gene, logFC, adj.P.Val)
+  
+  down <- df %>%
+    filter(logFC < -logfc_cut & adj.P.Val < pval_cut) %>%
+    arrange(adj.P.Val) %>%
+    head(top_n) %>%
+    mutate(Regulation = "Downregulated", Comparison = group_name) %>%
+    dplyr::select(Comparison, Regulation, gene, logFC, adj.P.Val)
+  
+  rbind(up, down)
+}
+
+# Create summary_table from the DE results
+summary_table <- rbind(
+  get_top_genes(unpaired_results, group_name = "Tumor vs Normal (All)"),
+  get_top_genes(results_non_smoker, group_name = "Tumor vs Normal (Non-smokers)"),
+  get_top_genes(results_smoker, group_name = "Tumor vs Normal (Smokers)"),
+  get_top_genes(results_paired, group_name = "Paired"),
+  get_top_genes(interaction_results, group_name = "Paired Smoker Interaction")
+)
+
+# dentify shared genes across groups (Up/Down separately)
+shared_genes <- summary_table %>%
+  group_by(Regulation, gene) %>%
+  summarize(n_groups = n_distinct(Comparison), .groups = "drop") %>%
+  filter(n_groups > 1) %>%
+  pull(gene)
+
+# Add asterisk for shared genes
+summary_table_marked <- summary_table %>%
+  mutate(gene = ifelse(gene %in% shared_genes, paste0(gene, "*"), gene)) %>%
+  dplyr::select(-adj.P.Val)   # remove adjusted p-value column
+
+# Remove row names
+rownames(summary_table_marked) <- NULL
+
+# Print clean table
+kable(summary_table_marked, caption = "Top upregulated and downregulated genes identified in tumor vs normal analyses across all samples, paired samples, smokers, non-smokers, and smoking interaction analysis (* indicates genes significant in multiple comparisons)") %>%
+  kable_styling(full_width = FALSE, position = "center", font_size = 10)
+```
