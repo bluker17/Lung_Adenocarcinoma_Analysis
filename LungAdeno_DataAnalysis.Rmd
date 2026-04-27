@@ -1,14 +1,14 @@
 ---
 title: "BINF6310_ Final_Project"
 author: "Bobby Luker"
-date: "2026-04-18"
+date: "2026-04-27"
 output: pdf_document
 ---
 
 # Initialize my environment and establish all needed libraries
 ```{r, message=FALSE, warning=FALSE}
 rm(list=ls())
-setwd("/Users/bobbyluker/Desktop/UNCC/BINF6311/Project/data/")
+setwd("/Users/bobbyluker/Desktop/UNCC/BINF6310/Project/data/")
 
 library(readxl) # Reads in excel files
 
@@ -47,7 +47,8 @@ rownames(expr_data) <- expr_data$gene
 expr_data$gene <- NULL
 
 # Filter low-expression genes
-filtered_lung_data <- expr_data[rowMeans(expr_data) > 0.5, ]
+# filtered_lung_data <- expr_data[rowMeans(expr_data) > 0.5, ]
+filtered_lung_data <- expr_data[rowSums(expr_data > 1) >= (0.2 * ncol(expr_data)),]
 
 # Log transform with a pseudocount of 1
 log_fld <- log2(filtered_lung_data + 1)
@@ -111,6 +112,37 @@ sample_count_table %>%
   column_spec(1, bold = TRUE)
 ```
 
+# p-value diagnostics function
+```{r}
+plot_limma_diagnostics <- function(fit, coef_name, title_prefix = "") {
+  
+  pvals <- fit$p.value[, coef_name]
+  logFC <- fit$coefficients[, coef_name]
+  
+  par(mfrow = c(1,2))
+  
+  # 1. P-value histogram
+  hist(pvals,
+       breaks = 50,
+       main = paste(title_prefix, "P-value histogram"),
+       xlab = "p-values",
+       col = "grey")
+  
+  # 2. QQ-style p-value plot (your professor’s Figure 4 style)
+  p_sorted <- sort(pvals)
+  expected <- (1:length(p_sorted)) / length(p_sorted)
+  
+  plot(expected, p_sorted,
+       main = paste(title_prefix, "P-value plot (QQ style)"),
+       xlab = "Expected (Uniform)",
+       ylab = "Observed p-values")
+  
+  abline(0,1,col="red")
+  
+  par(mfrow = c(1,1))
+}
+```
+
 # Paired Smoker Tissue Differential Expression Analysis using "limma" 
 ```{r}
 # Removing '_nor' from normal samples to correctly pair data
@@ -151,7 +183,9 @@ paired_matrix <- model.matrix(~ patient + group)
 
 # Fit linear model using limma, eBayes stabilizes variance estimates
 fit <- lmFit(log_fld_paired, paired_matrix)
-fit <- eBayes(fit)
+fit <- eBayes(fit, trend=TRUE)
+
+plot_limma_diagnostics(fit, "groupTumor", "PAIRED Tumor vs Normal")
 
 # Extract result
 results_paired <- topTable(
@@ -297,7 +331,7 @@ interaction_matrix <- model.matrix(~ Patient + Tissue * Smoking_Group, data = me
 
 # Fit model
 interaction_fit <- lmFit(log_fld_paired, interaction_matrix)
-interaction_fit <- eBayes(interaction_fit)
+interaction_fit <- eBayes(interaction_fit, trend=TRUE)
 
 # Extract interaction term
 interaction_results <- topTable(
@@ -440,7 +474,9 @@ colnames(unpaired_matrix) <- c("Intercept", "Tumor_vs_Normal")
 
 # Fit linear model using limma, eBayes stabilizes variance estimates
 unpaired_fit <- lmFit(log_fld, unpaired_matrix)
-unpaired_fit <- eBayes(unpaired_fit)
+unpaired_fit <- eBayes(unpaired_fit, trend=TRUE)
+
+plot_limma_diagnostics(unpaired_fit, "Tumor_vs_Normal", "UNPAIRED Tumor vs Normal")
 
 # Extract result
 unpaired_results <- topTable(unpaired_fit,
@@ -522,7 +558,11 @@ nonsmoker_contrast_matrix <- makeContrasts(
 
 # Fit linear model using limma, eBayes stabilizes variance estimates
 non_smoker_fit <- contrasts.fit(non_smoker_fit, nonsmoker_contrast_matrix)
-non_smoker_fit <- eBayes(non_smoker_fit)
+non_smoker_fit <- eBayes(non_smoker_fit, trend=TRUE)
+
+plot_limma_diagnostics(non_smoker_fit,
+                       "Tumor_Non_Smoker_vs_Normal_Non_Smoker",
+                       "NON-SMOKER contrast")
 
 # Extract result
 results_non_smoker <- topTable(non_smoker_fit, number = Inf)
@@ -589,7 +629,11 @@ smoker_contrast_matrix <- makeContrasts(
 
 # Fit linear model using limma, eBayes stabilizes variance estimates
 smoker_fit <- contrasts.fit(smoker_fit, smoker_contrast_matrix)
-smoker_fit <- eBayes(smoker_fit)
+smoker_fit <- eBayes(smoker_fit, trend=TRUE)
+
+plot_limma_diagnostics(smoker_fit,
+                       "Tumor_Smoker_vs_Normal_Smoker",
+                       "SMOKER contrast")
 
 # Extract result
 results_smoker <- topTable(smoker_fit, number = Inf)
@@ -690,8 +734,12 @@ summary_table_marked <- summary_table %>%
 
 # Remove row names
 rownames(summary_table_marked) <- NULL
-
+```
+\newpage
+```{r}
 # Print clean table
 kable(summary_table_marked, caption = "Top upregulated and downregulated genes identified in tumor vs normal analyses across all samples, paired samples, smokers, non-smokers, and smoking interaction analysis (* indicates genes significant in multiple comparisons)") %>%
   kable_styling(full_width = FALSE, position = "center", font_size = 10)
 ```
+
+
