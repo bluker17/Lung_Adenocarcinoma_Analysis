@@ -1,7 +1,7 @@
 ---
 title: "BINF6310_ Final_Project"
 author: "Bobby Luker"
-date: "2026-04-27"
+date: "2026-04-28"
 output: pdf_document
 ---
 
@@ -185,6 +185,7 @@ paired_matrix <- model.matrix(~ patient + group)
 fit <- lmFit(log_fld_paired, paired_matrix)
 fit <- eBayes(fit, trend=TRUE)
 
+# Checking p-values
 plot_limma_diagnostics(fit, "groupTumor", "PAIRED Tumor vs Normal")
 
 # Extract result
@@ -476,6 +477,7 @@ colnames(unpaired_matrix) <- c("Intercept", "Tumor_vs_Normal")
 unpaired_fit <- lmFit(log_fld, unpaired_matrix)
 unpaired_fit <- eBayes(unpaired_fit, trend=TRUE)
 
+# Checking p-values
 plot_limma_diagnostics(unpaired_fit, "Tumor_vs_Normal", "UNPAIRED Tumor vs Normal")
 
 # Extract result
@@ -560,6 +562,7 @@ nonsmoker_contrast_matrix <- makeContrasts(
 non_smoker_fit <- contrasts.fit(non_smoker_fit, nonsmoker_contrast_matrix)
 non_smoker_fit <- eBayes(non_smoker_fit, trend=TRUE)
 
+# Checking p-values
 plot_limma_diagnostics(non_smoker_fit,
                        "Tumor_Non_Smoker_vs_Normal_Non_Smoker",
                        "NON-SMOKER contrast")
@@ -631,6 +634,7 @@ smoker_contrast_matrix <- makeContrasts(
 smoker_fit <- contrasts.fit(smoker_fit, smoker_contrast_matrix)
 smoker_fit <- eBayes(smoker_fit, trend=TRUE)
 
+# Checking p-values
 plot_limma_diagnostics(smoker_fit,
                        "Tumor_Smoker_vs_Normal_Smoker",
                        "SMOKER contrast")
